@@ -20,7 +20,7 @@ st.markdown("""
     .stButton>button { width: 100%; border-radius: 5px; height: 3em; }
     div[data-testid="stExpander"] { background-color: #ffffff; border-radius: 10px; }
     </style>
-""", unsafe_allow_index=True)
+""", unsafe_allow_html=True)
 
 # ---------- 2. 数据库逻辑 ----------
 DB_NAME = 'lab_inventory.db'
