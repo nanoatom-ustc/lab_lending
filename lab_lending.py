@@ -1,424 +1,229 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import datetime
 import plotly.express as px
+import os
 
-# 页面配置
+# ---------- 1. 页面配置 ----------
 st.set_page_config(
-    page_title="实验室物资管理系统",
-    page_icon="🔬",
+    page_title="8004 实验室物资管理系统",
+    page_icon="📋",
     layout="wide"
 )
 
-# 初始化数据库
-def init_database():
-    conn = sqlite3.connect('lab_materials.db')
-    c = conn.cursor()
-    
-    # 物资表
-    c.execute('''CREATE TABLE IF NOT EXISTS materials
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  name TEXT NOT NULL,
-                  category TEXT,
-                  total_quantity INTEGER DEFAULT 0,
-                  available_quantity INTEGER DEFAULT 0,
-                  unit TEXT,
-                  location TEXT,
-                  created_time TIMESTAMP)''')
-    
-    # 借出/借入记录表
-    c.execute('''CREATE TABLE IF NOT EXISTS transactions
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  material_id INTEGER,
-                  borrower_name TEXT NOT NULL,
-                  transaction_type TEXT,  -- 'borrow' 或 'return'
-                  quantity INTEGER,
-                  borrow_time TIMESTAMP,
-                  return_time TIMESTAMP,
-                  status TEXT,  -- 'borrowed', 'returned'
-                  notes TEXT,
-                  FOREIGN KEY (material_id) REFERENCES materials (id))''')
-    
-    conn.commit()
-    conn.close()
+# 自定义 CSS：强化表格对比度，按钮颜色统一，侧边栏精简化
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; }
+    div[data-testid="stExpander"] { background-color: #ffffff; border-radius: 10px; }
+    </style>
+""", unsafe_allow_index=True)
 
-# 获取所有物资
-def get_all_materials():
-    conn = sqlite3.connect('lab_materials.db')
-    df = pd.read_sql_query("SELECT * FROM materials ORDER BY id", conn)
-    conn.close()
-    return df
+# ---------- 2. 数据库逻辑 ----------
+DB_NAME = 'lab_inventory.db'
 
-# 获取所有借出记录
-def get_all_transactions(status=None):
-    conn = sqlite3.connect('lab_materials.db')
-    query = """
-        SELECT t.*, m.name as material_name, m.unit 
-        FROM transactions t
-        JOIN materials m ON t.material_id = m.id
-    """
-    if status:
-        query += f" WHERE t.status = '{status}'"
-    query += " ORDER BY t.borrow_time DESC"
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
-
-# 添加新物资
-def add_material(name, category, quantity, unit, location):
-    conn = sqlite3.connect('lab_materials.db')
-    c = conn.cursor()
-    c.execute("""INSERT INTO materials 
-                 (name, category, total_quantity, available_quantity, unit, location, created_time)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
-              (name, category, quantity, quantity, unit, location, datetime.now()))
-    conn.commit()
-    conn.close()
-
-# 借出物资
-def borrow_material(material_id, borrower_name, quantity, notes):
-    conn = sqlite3.connect('lab_materials.db')
-    c = conn.cursor()
-    
-    # 检查可用数量
-    c.execute("SELECT available_quantity FROM materials WHERE id = ?", (material_id,))
-    available = c.fetchone()[0]
-    
-    if available >= quantity:
-        # 更新物资数量
-        c.execute("UPDATE materials SET available_quantity = available_quantity - ? WHERE id = ?",
-                 (quantity, material_id))
-        
-        # 添加借出记录
-        c.execute("""INSERT INTO transactions 
-                     (material_id, borrower_name, transaction_type, quantity, borrow_time, status, notes)
-                     VALUES (?, ?, 'borrow', ?, ?, 'borrowed', ?)""",
-                  (material_id, borrower_name, quantity, datetime.now(), notes))
-        
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        # 物资基础信息表
+        c.execute('''CREATE TABLE IF NOT EXISTS materials
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      name TEXT NOT NULL,
+                      category TEXT,
+                      total_qty INTEGER DEFAULT 0,
+                      available_qty INTEGER DEFAULT 0,
+                      unit TEXT,
+                      location TEXT,
+                      update_time TIMESTAMP)''')
+        # 借还流水记录表
+        c.execute('''CREATE TABLE IF NOT EXISTS transactions
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      material_id INTEGER,
+                      user_name TEXT NOT NULL,
+                      type TEXT, -- 'borrow' or 'return'
+                      qty INTEGER,
+                      time TIMESTAMP,
+                      status TEXT, -- 'active' or 'closed'
+                      notes TEXT,
+                      FOREIGN KEY (material_id) REFERENCES materials (id))''')
         conn.commit()
-        conn.close()
-        return True, "借出成功"
-    else:
-        conn.close()
-        return False, f"库存不足，当前可用数量：{available}"
 
-# 归还物资
-def return_material(transaction_id, return_quantity=None):
-    conn = sqlite3.connect('lab_materials.db')
-    c = conn.cursor()
-    
-    # 获取借出记录
-    c.execute("SELECT material_id, quantity, status FROM transactions WHERE id = ?", (transaction_id,))
-    result = c.fetchone()
-    
-    if result and result[2] == 'borrowed':
-        material_id, borrowed_qty, _ = result
-        
-        # 如果没有指定归还数量，默认全部归还
-        if return_quantity is None or return_quantity >= borrowed_qty:
-            return_qty = borrowed_qty
-            # 更新物资库存
-            c.execute("UPDATE materials SET available_quantity = available_quantity + ? WHERE id = ?",
-                     (borrowed_qty, material_id))
-            # 更新记录状态
-            c.execute("""UPDATE transactions 
-                         SET return_time = ?, status = 'returned', quantity = ?
-                         WHERE id = ?""",
-                      (datetime.now(), borrowed_qty, transaction_id))
-            success_msg = f"全部归还成功，共 {borrowed_qty} 件"
-            success = True
-        else:
-            # 部分归还
-            return_qty = return_quantity
-            # 更新物资库存
-            c.execute("UPDATE materials SET available_quantity = available_quantity + ? WHERE id = ?",
-                     (return_qty, material_id))
-            # 更新原记录数量
-            new_quantity = borrowed_qty - return_qty
-            c.execute("UPDATE transactions SET quantity = ? WHERE id = ?",
-                     (new_quantity, transaction_id))
-            # 创建部分归还记录
-            c.execute("""INSERT INTO transactions 
-                         (material_id, borrower_name, transaction_type, quantity, borrow_time, return_time, status, notes)
-                         SELECT material_id, borrower_name, 'return', ?, borrow_time, ?, 'returned', notes
-                         FROM transactions WHERE id = ?""",
-                      (return_qty, datetime.now(), transaction_id))
-            success_msg = f"部分归还成功，归还 {return_qty} 件，剩余 {new_quantity} 件未归还"
-            success = True
-        
+def get_data(query):
+    with sqlite3.connect(DB_NAME) as conn:
+        return pd.read_sql_query(query, conn)
+
+def execute_db(query, params=()):
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute(query, params)
         conn.commit()
-        conn.close()
-        return success, success_msg
-    else:
-        conn.close()
-        return False, "记录不存在或已归还"
 
-# 主页面
-def main():
-    st.title("🔬 实验室物资管理系统")
-    st.markdown("---")
-    
-    # 侧边栏导航
-    menu = st.sidebar.selectbox(
-        "功能菜单",
-        ["📊 仪表板", "📦 物资管理", "📤 物资借出", "📥 物资归还", "📋 借还记录", "📈 统计分析"]
-    )
-    
-    # 初始化数据库
-    init_database()
-    
-    if menu == "📊 仪表板":
-        show_dashboard()
-    elif menu == "📦 物资管理":
-        show_material_management()
-    elif menu == "📤 物资借出":
-        show_borrow_interface()
-    elif menu == "📥 物资归还":
-        show_return_interface()
-    elif menu == "📋 借还记录":
-        show_transactions()
-    elif menu == "📈 统计分析":
-        show_statistics()
+# ---------- 3. 业务功能函数 ----------
+def borrow_item(m_id, user, qty, note):
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT available_qty FROM materials WHERE id = ?", (m_id,))
+        current_avail = c.fetchone()[0]
+        if current_avail >= qty:
+            # 更新库存
+            c.execute("UPDATE materials SET available_qty = available_qty - ? WHERE id = ?", (qty, m_id))
+            # 插入记录
+            c.execute("INSERT INTO transactions (material_id, user_name, type, qty, time, status, notes) VALUES (?, ?, 'borrow', ?, ?, 'active', ?)",
+                      (m_id, user, qty, datetime.now(), note))
+            conn.commit()
+            return True, "借出登记成功"
+        return False, "库存不足"
 
+def return_item(t_id, r_qty):
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT material_id, qty FROM transactions WHERE id = ?", (t_id,))
+        res = c.fetchone()
+        if res:
+            m_id, b_qty = res
+            # 更新库存
+            c.execute("UPDATE materials SET available_qty = available_qty + ? WHERE id = ?", (r_qty, m_id))
+            # 更新/关闭原借出记录
+            if r_qty >= b_qty:
+                c.execute("UPDATE transactions SET status = 'closed', time = ? WHERE id = ?", (datetime.now(), t_id))
+            else:
+                c.execute("UPDATE transactions SET qty = qty - ? WHERE id = ?", (r_qty, t_id))
+            conn.commit()
+            return True, "归还登记成功"
+        return False, "未找到记录"
+
+# ---------- 4. 各模块界面 ----------
 def show_dashboard():
+    st.subheader("📊 运行概况")
+    m_df = get_data("SELECT * FROM materials")
+    t_df = get_data("SELECT * FROM transactions WHERE status = 'active'")
+    
     col1, col2, col3, col4 = st.columns(4)
-    
-    # 统计数据
-    materials_df = get_all_materials()
-    transactions_df = get_all_transactions()
-    
-    total_materials = len(materials_df)
-    total_items = materials_df['total_quantity'].sum() if not materials_df.empty else 0
-    borrowed_items = transactions_df[transactions_df['status'] == 'borrowed']['quantity'].sum() if not transactions_df.empty else 0
-    active_borrows = len(transactions_df[transactions_df['status'] == 'borrowed']) if not transactions_df.empty else 0
-    
-    with col1:
-        st.metric("物资种类", total_materials)
-    with col2:
-        st.metric("物资总数", total_items)
-    with col3:
-        st.metric("已借出数量", borrowed_items)
-    with col4:
-        st.metric("进行中借阅", active_borrows)
-    
+    col1.metric("物资种类", len(m_df))
+    col2.metric("在库总件数", m_df['available_qty'].sum() if not m_df.empty else 0)
+    col3.metric("外部借出中", t_df['qty'].sum() if not t_df.empty else 0)
+    col4.metric("未结清流程", len(t_df))
+
     st.markdown("---")
-    
-    # 最近借出记录
-    st.subheader("📝 最近借出记录")
-    if not transactions_df.empty:
-        recent = transactions_df.head(10)[['borrower_name', 'material_name', 'quantity', 'borrow_time', 'status']]
-        recent.columns = ['借用人', '物资名称', '数量', '借出时间', '状态']
-        st.dataframe(recent, use_container_width=True)
-    else:
-        st.info("暂无借出记录")
-    
-    # 库存预警
-    st.subheader("⚠️ 库存预警")
-    if not materials_df.empty:
-        low_stock = materials_df[materials_df['available_quantity'] < 5]
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.subheader("🔍 库存快速查询")
+        search = st.text_input("输入关键词搜索物资...", placeholder="零件名、型号、位置...")
+        if not m_df.empty:
+            display_m = m_df[['name', 'category', 'available_qty', 'unit', 'location']]
+            if search:
+                display_m = display_m[display_m['name'].str.contains(search, case=False) | display_m['location'].str.contains(search, case=False)]
+            st.dataframe(display_m, use_container_width=True, hide_index=True)
+
+    with c2:
+        st.subheader("⚠️ 库存预警")
+        low_stock = m_df[m_df['available_qty'] < 5]
         if not low_stock.empty:
-            st.warning("以下物资库存不足5件：")
-            st.dataframe(low_stock[['name', 'available_quantity', 'unit']], use_container_width=True)
+            st.error("以下物资库存不足 5 件：")
+            st.table(low_stock[['name', 'available_qty']])
         else:
             st.success("所有物资库存充足")
 
-def show_material_management():
-    st.header("物资管理")
-    
-    # 添加新物资
-    with st.expander("➕ 添加新物资", expanded=True):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            name = st.text_input("物资名称")
-        with col2:
-            category = st.selectbox("类别", ["仪器设备", "试剂耗材", "办公用品", "其他"])
-        with col3:
-            quantity = st.number_input("数量", min_value=0, step=1)
-        with col4:
-            unit = st.text_input("单位", value="件")
-        
-        location = st.text_input("存放位置")
-        
-        if st.button("添加物资", type="primary"):
-            if name and quantity >= 0:
-                add_material(name, category, quantity, unit, location)
-                st.success(f"成功添加物资：{name}")
+def show_management():
+    st.subheader("📦 物资入库与编辑")
+    with st.expander("➕ 新增物资条目"):
+        c1, c2, c3 = st.columns(3)
+        name = c1.text_input("物资名称/型号")
+        cat = c2.selectbox("分类", ["光学件", "机械件", "电子/射频", "耗材", "办公用品"])
+        qty = c3.number_input("初始总库存", min_value=1, step=1)
+        c4, c5 = st.columns(2)
+        unit = c4.text_input("单位", value="件")
+        loc = c5.text_input("存放位置")
+        if st.button("提交入库"):
+            if name:
+                execute_db("INSERT INTO materials (name, category, total_qty, available_qty, unit, location, update_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (name, cat, qty, qty, unit, loc, datetime.now()))
+                st.success(f"{name} 已入库")
                 st.rerun()
-            else:
-                st.error("请填写完整信息")
-    
-    # 显示现有物资
-    st.subheader("📋 现有物资清单")
-    materials_df = get_all_materials()
-    
-    if not materials_df.empty:
-        # 搜索和筛选
-        col1, col2 = st.columns(2)
-        with col1:
-            search = st.text_input("🔍 搜索物资", placeholder="输入物资名称...")
-        with col2:
-            category_filter = st.selectbox("筛选类别", ["全部"] + list(materials_df['category'].unique()))
-        
-        filtered_df = materials_df.copy()
-        if search:
-            filtered_df = filtered_df[filtered_df['name'].str.contains(search, case=False)]
-        if category_filter != "全部":
-            filtered_df = filtered_df[filtered_df['category'] == category_filter]
-        
-        # 显示表格
-        display_df = filtered_df[['id', 'name', 'category', 'total_quantity', 'available_quantity', 'unit', 'location']]
-        display_df.columns = ['ID', '名称', '类别', '总数', '可用数', '单位', '位置']
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("暂无物资，请先添加")
 
-def show_borrow_interface():
-    st.header("物资借出")
-    
-    materials_df = get_all_materials()
-    available_materials = materials_df[materials_df['available_quantity'] > 0]
-    
-    if available_materials.empty:
-        st.warning("没有可借出的物资")
-        return
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        material_options = {f"{row['name']} (剩余: {row['available_quantity']}{row['unit']})": row['id'] 
-                           for _, row in available_materials.iterrows()}
-        selected_material = st.selectbox("选择物资", list(material_options.keys()))
-        material_id = material_options[selected_material]
-        
-        # 获取最大可借数量
-        max_qty = available_materials[available_materials['id'] == material_id]['available_quantity'].values[0]
-        quantity = st.number_input("借出数量", min_value=1, max_value=int(max_qty), step=1)
-    
-    with col2:
-        borrower_name = st.text_input("借用人姓名")
-        notes = st.text_area("备注", placeholder="用途、预计归还时间等")
-    
-    if st.button("确认借出", type="primary"):
-        if borrower_name and quantity > 0:
-            success, message = borrow_material(material_id, borrower_name, quantity, notes)
-            if success:
-                st.success(message)
-                st.rerun()
-            else:
-                st.error(message)
-        else:
-            st.error("请填写完整信息")
-
-def show_return_interface():
-    st.header("物资归还")
-    
-    # 获取所有未归还的借出记录
-    borrowed_df = get_all_transactions(status='borrowed')
-    
-    if borrowed_df.empty:
-        st.info("当前没有未归还的借出记录")
-        return
-    
-    # 显示未归还记录
-    st.subheader("未归还记录")
-    display_df = borrowed_df[['id', 'borrower_name', 'material_name', 'quantity', 'unit', 'borrow_time', 'notes']]
-    display_df.columns = ['记录ID', '借用人', '物资名称', '借出数量', '单位', '借出时间', '备注']
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-    
-    st.markdown("---")
-    
-    # 归还操作
-    st.subheader("归还操作")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        transaction_options = {f"{row['borrower_name']} - {row['material_name']} (借出:{row['quantity']}{row['unit']})": row['id'] 
-                              for _, row in borrowed_df.iterrows()}
-        selected_transaction = st.selectbox("选择借出记录", list(transaction_options.keys()))
-        transaction_id = transaction_options[selected_transaction]
-        
-        # 获取借出数量
-        borrowed_qty = borrowed_df[borrowed_df['id'] == transaction_id]['quantity'].values[0]
-        return_quantity = st.number_input("归还数量", min_value=1, max_value=int(borrowed_qty), value=int(borrowed_qty), step=1)
-    
-    if st.button("确认归还", type="primary"):
-        success, message = return_material(transaction_id, return_quantity)
-        if success:
-            st.success(message)
+    st.subheader("🛠️ 基础数据管理")
+    m_df = get_data("SELECT * FROM materials")
+    if not m_df.empty:
+        # 使用 data_editor 允许用户直接在表格里修数据
+        edited_df = st.data_editor(m_df, num_rows="dynamic", use_container_width=True, key="m_editor")
+        if st.button("保存基础表修改"):
+            # 这里简单演示：直接将编辑后的表覆盖回数据库（实际生产建议逐行对比）
+            with sqlite3.connect(DB_NAME) as conn:
+                edited_df.to_sql('materials', conn, if_exists='replace', index=False)
+            st.success("基础数据已更新")
             st.rerun()
+
+def show_borrow_return():
+    tab1, tab2 = st.tabs(["📤 借出登记", "📥 归还入库"])
+    
+    with tab1:
+        m_df = get_data("SELECT id, name, available_qty, unit FROM materials WHERE available_qty > 0")
+        if m_df.empty:
+            st.info("暂无库存可借出")
         else:
-            st.error(message)
+            with st.form("borrow_form"):
+                m_list = {f"{r['name']} (剩余 {r['available_qty']} {r['unit']})": r['id'] for _, r in m_df.iterrows()}
+                target = st.selectbox("选择物资", list(m_list.keys()))
+                user = st.text_input("借用人姓名")
+                b_qty = st.number_input("借出数量", min_value=1, step=1)
+                note = st.text_area("用途/备注")
+                if st.form_submit_button("确认借出"):
+                    if user:
+                        success, msg = borrow_item(m_list[target], user, b_qty, note)
+                        if success: st.success(msg); st.rerun()
+                        else: st.error(msg)
+                    else: st.error("请填写借用人")
 
-def show_transactions():
-    st.header("借还记录")
-    
-    # 筛选选项
-    filter_type = st.selectbox("筛选状态", ["全部", "进行中", "已归还"])
-    
-    transactions_df = get_all_transactions()
-    
-    if not transactions_df.empty:
-        if filter_type == "进行中":
-            transactions_df = transactions_df[transactions_df['status'] == 'borrowed']
-        elif filter_type == "已归还":
-            transactions_df = transactions_df[transactions_df['status'] == 'returned']
-        
-        # 显示记录
-        display_df = transactions_df[['borrower_name', 'material_name', 'quantity', 'unit', 
-                                     'borrow_time', 'return_time', 'status', 'notes']]
-        display_df.columns = ['借用人', '物资名称', '数量', '单位', '借出时间', '归还时间', '状态', '备注']
-        
-        # 格式化时间
-        display_df['借出时间'] = pd.to_datetime(display_df['借出时间']).dt.strftime('%Y-%m-%d %H:%M')
-        display_df['归还时间'] = pd.to_datetime(display_df['归还时间']).dt.strftime('%Y-%m-%d %H:%M') if not display_df['归还时间'].isna().all() else ''
-        
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-        
-        # 导出功能
-        if st.button("导出记录为CSV"):
-            csv = transactions_df.to_csv(index=False)
-            st.download_button("下载CSV", csv, "transactions.csv", "text/csv")
-    else:
-        st.info("暂无借还记录")
+    with tab2:
+        t_df = get_data("""SELECT t.id, t.user_name, m.name as m_name, t.qty, m.unit 
+                           FROM transactions t JOIN materials m ON t.material_id = m.id 
+                           WHERE t.status = 'active'""")
+        if t_df.empty:
+            st.info("当前无待归还物资")
+        else:
+            with st.form("return_form"):
+                t_list = {f"{r['user_name']} - {r['m_name']} ({r['qty']} {r['unit']})": r['id'] for _, r in t_df.iterrows()}
+                target_t = st.selectbox("选择待归还记录", list(t_list.keys()))
+                r_qty = st.number_input("归还数量", min_value=1, step=1)
+                if st.form_submit_button("确认归还"):
+                    success, msg = return_item(t_list[target_t], r_qty)
+                    if success: st.success(msg); st.rerun()
+                    else: st.error(msg)
 
-def show_statistics():
-    st.header("统计分析")
+def show_logs():
+    st.subheader("📋 历史操作流水")
+    query = """
+        SELECT t.user_name as 人员, m.name as 物资, t.type as 类型, t.qty as 数量, 
+               t.time as 操作时间, t.status as 状态, t.notes as 备注
+        FROM transactions t
+        JOIN materials m ON t.material_id = m.id
+        ORDER BY t.time DESC
+    """
+    logs_df = get_data(query)
+    st.dataframe(logs_df, use_container_width=True)
     
-    transactions_df = get_all_transactions()
+    if st.button("导出为 CSV"):
+        logs_df.to_csv("lab_history_logs.csv", index=False)
+        st.success("已生成 lab_history_logs.csv 文件")
+
+# ---------- 5. 主程序入口 ----------
+def main():
+    init_db()
     
-    if transactions_df.empty:
-        st.info("暂无数据")
-        return
+    st.sidebar.title("8004 实验室管理")
+    menu = st.sidebar.radio("功能菜单", ["📊 统计仪表板", "📦 物资管理", "🔃 借还登记", "📋 历史审计"])
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # 借出次数最多的物资
-        st.subheader("最受欢迎物资")
-        popular = transactions_df[transactions_df['status'] == 'borrowed']['material_name'].value_counts().head(10)
-        if not popular.empty:
-            fig = px.bar(x=popular.values, y=popular.index, orientation='h', 
-                        title="借出次数最多的物资")
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # 借用人排行
-        st.subheader("借用最频繁的人员")
-        frequent_borrowers = transactions_df[transactions_df['status'] == 'borrowed']['borrower_name'].value_counts().head(10)
-        if not frequent_borrowers.empty:
-            fig = px.bar(x=frequent_borrowers.values, y=frequent_borrowers.index, orientation='h',
-                        title="借用次数最多的人员")
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # 借出趋势
-    st.subheader("借出趋势")
-    transactions_df['borrow_date'] = pd.to_datetime(transactions_df['borrow_time']).dt.date
-    daily_borrows = transactions_df.groupby('borrow_date').size().reset_index(name='count')
-    if not daily_borrows.empty:
-        fig = px.line(daily_borrows, x='borrow_date', y='count', title="每日借出数量趋势")
-        st.plotly_chart(fig, use_container_width=True)
+    if menu == "📊 统计仪表板":
+        show_dashboard()
+    elif menu == "📦 物资管理":
+        show_management()
+    elif menu == "🔃 借还登记":
+        show_borrow_return()
+    elif menu == "📋 历史审计":
+        show_logs()
 
 if __name__ == "__main__":
     main()
